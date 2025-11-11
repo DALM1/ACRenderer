@@ -1,4 +1,9 @@
-ACRenderer
+<h1 align="center">
+  <br>
+    ACRenderer
+  <br>
+  <img src="https://github.com/DALM1/SKRender/blob/main/SKRender-demo.png?raw=true" alt="SKRender" width="800">
+</h1>
 =========
 
 Simple Metal-based renderer with a minimal glTF 2.0 (GLB) loader and an orbit camera example.
