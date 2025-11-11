@@ -21,14 +21,30 @@ static void mat4_lookAt(float* m, float eyeX,float eyeY,float eyeZ, float center
     id<MTLDevice> _device;
     id<MTLCommandQueue> _queue;
     id<MTLRenderPipelineState> _pipeline;
+    id<MTLRenderPipelineState> _skyPipeline;
+    id<MTLDepthStencilState> _skyDepthState;
+    id<MTLBuffer> _skyUniformBuffer;
+    id<MTLBuffer> _skyIndexBuffer;
+    NSUInteger _skyIndexCount;
+    id<MTLRenderPipelineState> _groundPipeline;
+    id<MTLBuffer> _groundVertexBuffer;
+    id<MTLBuffer> _groundDomeVertexBuffer;
+    id<MTLBuffer> _groundDomeIndexBuffer;
+    NSUInteger _groundDomeIndexCount;
+    id<MTLBuffer> _groundUniformBuffer;
     id<MTLBuffer> _vertexBuffer;
     id<MTLBuffer> _indexBuffer;
     NSUInteger _indexCount;
     NSUInteger _vertexCount;
     id<MTLTexture> _texture;
-    id<MTLBuffer> _uniformBuffer; // MVP
+    id<MTLBuffer> _uniformBuffer; // MVP + extras
+    id<MTLBuffer> _skyVertexBuffer;
     float _modelCenter[3];
     float _modelScale;
+    // Model bounds for ground placement
+    float _modelMinY;
+    float _modelMaxY;
+    float _modelExtentY;
     id<MTLDepthStencilState> _depthState;
     id<MTLTexture> _depthTexture;
     CGSize _depthSize;
@@ -39,13 +55,22 @@ static void mat4_lookAt(float* m, float eyeX,float eyeY,float eyeZ, float center
     float _camPitch;  // radians
     float _camDist;   // units
     float _camTarget[3];
+
+    // Storm/lighting state
+    float _time;
+    float _exposure;
+    float _stormIntensity;
+
+    // Ground collision constraints
+    float _groundY;
+    float _groundClearance;
 }
 
 static NSString* kMSLTextured = @
     "using namespace metal;\n"
     "struct VSIn { float3 position [[attribute(0)]]; float2 uv [[attribute(1)]]; };\n"
     "struct VSOut { float4 position [[position]]; float2 uv; };\n"
-    "struct Uniforms { float4x4 mvp; };\n"
+    "struct Uniforms { float4x4 mvp; float time; float exposure; float storm; };\n"
     "vertex VSOut vertex_main(VSIn in [[stage_in]],\n"
     "                        constant Uniforms& U [[ buffer(1) ]]) {\n"
     "  VSOut o;\n"
@@ -55,8 +80,67 @@ static NSString* kMSLTextured = @
     "}\n"
     "fragment float4 fragment_main(VSOut in [[stage_in]],\n"
     "                             texture2d<float> tex [[ texture(0) ]],\n"
-    "                             sampler s [[ sampler(0) ]]) {\n"
-    "  return tex.sample(s, in.uv);\n"
+    "                             sampler s [[ sampler(0) ]],\n"
+    "                             constant Uniforms& U [[ buffer(1) ]]) {\n"
+    "  float4 c = tex.sample(s, in.uv);\n"
+    "  // Simple lightning pulse: occasional flashes brighten the scene\n"
+    "  float pulse = smoothstep(0.98, 1.0, sin(U.time * 20.0));\n"
+    "  float exp = max(0.5, U.exposure + pulse * U.storm);\n"
+    "  c.rgb *= exp;\n"
+    "  return c;\n"
+    "}\n";
+
+// Procedural stormy sky (full-screen quad rendered in world behind the model)
+static NSString* kMSLSky = @
+    "using namespace metal;\n"
+    "struct SkyVSIn { float3 position [[attribute(0)]]; float2 uv [[attribute(1)]]; };\n"
+    "struct SkyVSOut { float4 position [[position]]; float3 dir; float2 uv; };\n"
+    "struct SkyUniforms { float4x4 mvp; float time; float exposure; float storm; };\n"
+    "inline float hash31(float3 p){ p = fract(p*0.3183099 + float3(0.1,0.2,0.3)); p += dot(p, p.yzx + 19.19); return fract((p.x + p.y) * p.z); }\n"
+    "inline float noise3(float3 p){ float3 i = floor(p); float3 f = fract(p); float n = mix(mix(mix(hash31(i+float3(0,0,0)), hash31(i+float3(1,0,0)), f.x), mix(hash31(i+float3(0,1,0)), hash31(i+float3(1,1,0)), f.x), f.y), mix(mix(hash31(i+float3(0,0,1)), hash31(i+float3(1,0,1)), f.x), mix(hash31(i+float3(0,1,1)), hash31(i+float3(1,1,1)), f.x), f.y), f.z); return n; }\n"
+    "inline float fbm3(float3 p){ float a=0.0, w=0.5; float3 q=p; for(int i=0;i<5;i++){ a+=w*noise3(q); q*=2.02; w*=0.55; } return a; }\n"
+    "vertex SkyVSOut sky_vertex(SkyVSIn in [[stage_in]], constant SkyUniforms& U [[ buffer(1) ]]) {\n"
+    "  SkyVSOut o; o.position = U.mvp * float4(in.position, 1.0); o.dir = normalize(in.position); o.uv = in.uv; return o;\n"
+    "}\n"
+    "fragment float4 sky_fragment(SkyVSOut in [[stage_in]], constant SkyUniforms& U [[ buffer(1) ]]) {\n"
+    "  float3 d = in.dir; float t = U.time;\n"
+    "  float3 p = d*0.8 + float3(0.0, t*0.03, 0.0);\n"
+    "  float c = fbm3(p) * 0.9 + fbm3(p*1.9)*0.5;\n"
+    "  float grad = smoothstep(-0.1, 0.6, d.y);\n"
+    "  float skyBase = mix(0.05, 0.20, grad);\n"
+    "  float clouds = smoothstep(0.35, 0.75, c);\n"
+    "  float brightness = skyBase + clouds*0.55;\n"
+    "  float flash = U.storm>0.2 ? smoothstep(0.0, 0.5, sin(t*20.0)*0.5+0.5) * U.exposure*0.4 : 0.0;\n"
+    "  float3 col = float3(0.15,0.18,0.22)*brightness + float3(0.8,0.85,1.0)*flash;\n"
+    "  return float4(clamp(col,0.0,1.0), 1.0);\n"
+    "}\n";
+
+// Infinite-looking checkerboard floor (large plane with world-anchored checker)
+static NSString* kMSLGround = @
+    "using namespace metal;\n"
+    "struct GroundVSIn { float3 position [[attribute(0)]]; float2 uv [[attribute(1)]]; };\n"
+    "struct GroundVSOut { float4 position [[position]]; float3 local; };\n"
+    "struct GroundUniforms { float4x4 mvp; float tile; float exposure; float storm; float offsetX; float offsetZ; float fogStart; float fogEnd; float3 horizonColor; };\n"
+    "vertex GroundVSOut ground_vertex(GroundVSIn in [[stage_in]], constant GroundUniforms& U [[ buffer(1) ]]) {\n"
+    "  GroundVSOut o; o.position = U.mvp * float4(in.position, 1.0); o.local = in.position; return o;\n"
+    "}\n"
+    "fragment float4 ground_fragment(GroundVSOut in [[stage_in]], constant GroundUniforms& U [[ buffer(1) ]]) {\n"
+    "  float2 wp = (in.local.xz + float2(U.offsetX, U.offsetZ)) / max(U.tile, 1e-3);\n"
+    "  // Checker via fract/XOR (robust, avoids int/fmod issues)\n"
+    "  float2 f = fract(wp);\n"
+    "  float a = step(0.5, f.x);\n"
+    "  float b = step(0.5, f.y);\n"
+    "  float m = abs(a - b);\n"
+    "  float3 colA = float3(0.0,0.0,0.0);\n"
+    "  float3 colB = float3(1.0,1.0,1.0);\n"
+    "  float3 base = mix(colA, colB, m);\n"
+    "  base *= 1.0;\n"
+    "  // Keep fog disabled in test (values set very far in CPU)\n"
+    "  float ndcY = in.position.y / max(in.position.w, 1e-4);\n"
+    "  float h = smoothstep(-0.02, 0.08, ndcY);\n"
+    "  float fog = h;\n"
+    "  float3 col = mix(base, U.horizonColor, fog);\n"
+    "  return float4(col, 1.0);\n"
     "}\n";
 
 typedef struct { float x,y,z; } Vec3;
@@ -283,7 +367,8 @@ static BOOL loadGLB(NSString* path,
     _queue = [_device newCommandQueue];
 
     NSError *err = nil;
-    id<MTLLibrary> lib = [_device newLibraryWithSource:kMSLTextured options:nil error:&err];
+    NSString* mslSrc = [[[kMSLTextured stringByAppendingString:kMSLSky] stringByAppendingString:kMSLGround] copy];
+    id<MTLLibrary> lib = [_device newLibraryWithSource:mslSrc options:nil error:&err];
     if (!lib) { NSLog(@"Metal library compilation failed: %@", err); return; }
     id<MTLFunction> vs = [lib newFunctionWithName:@"vertex_main"];
     id<MTLFunction> fs = [lib newFunctionWithName:@"fragment_main"];
@@ -308,7 +393,124 @@ static BOOL loadGLB(NSString* path,
     _pipeline = [_device newRenderPipelineStateWithDescriptor:desc error:&err];
     if (!_pipeline) { NSLog(@"Pipeline creation failed: %@", err); return; }
 
-    _uniformBuffer = [_device newBufferWithLength:sizeof(float)*16 options:MTLResourceStorageModeShared];
+    // Sky pipeline (opaque dome)
+    id<MTLFunction> skyVS = [lib newFunctionWithName:@"sky_vertex"];
+    id<MTLFunction> skyFS = [lib newFunctionWithName:@"sky_fragment"];
+    MTLVertexDescriptor *skyVD = [[MTLVertexDescriptor alloc] init];
+    skyVD.attributes[0].format = MTLVertexFormatFloat3; skyVD.attributes[0].offset = 0; skyVD.attributes[0].bufferIndex = 0;
+    skyVD.attributes[1].format = MTLVertexFormatFloat2; skyVD.attributes[1].offset = sizeof(float)*3; skyVD.attributes[1].bufferIndex = 0;
+    skyVD.layouts[0].stride = sizeof(VertexPU);
+    skyVD.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex; skyVD.layouts[0].stepRate = 1;
+    MTLRenderPipelineDescriptor *skyDesc = [[MTLRenderPipelineDescriptor alloc] init];
+    skyDesc.vertexFunction = skyVS; skyDesc.fragmentFunction = skyFS; skyDesc.vertexDescriptor = skyVD;
+    skyDesc.colorAttachments[0].pixelFormat = _layer.pixelFormat; skyDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    _skyPipeline = [_device newRenderPipelineStateWithDescriptor:skyDesc error:&err];
+    if (!_skyPipeline) { NSLog(@"Sky pipeline creation failed: %@", err); }
+
+    // Ground pipeline (checker plane)
+    id<MTLFunction> groundVS = [lib newFunctionWithName:@"ground_vertex"];
+    id<MTLFunction> groundFS = [lib newFunctionWithName:@"ground_fragment"];
+    MTLVertexDescriptor *groundVD = [[MTLVertexDescriptor alloc] init];
+    groundVD.attributes[0].format = MTLVertexFormatFloat3; groundVD.attributes[0].offset = 0; groundVD.attributes[0].bufferIndex = 0;
+    groundVD.attributes[1].format = MTLVertexFormatFloat2; groundVD.attributes[1].offset = sizeof(float)*3; groundVD.attributes[1].bufferIndex = 0;
+    groundVD.layouts[0].stride = sizeof(VertexPU);
+    groundVD.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex; groundVD.layouts[0].stepRate = 1;
+    MTLRenderPipelineDescriptor *groundDesc = [[MTLRenderPipelineDescriptor alloc] init];
+    groundDesc.vertexFunction = groundVS; groundDesc.fragmentFunction = groundFS; groundDesc.vertexDescriptor = groundVD;
+    groundDesc.colorAttachments[0].pixelFormat = _layer.pixelFormat; groundDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    _groundPipeline = [_device newRenderPipelineStateWithDescriptor:groundDesc error:&err];
+    if (!_groundPipeline) { NSLog(@"Ground pipeline creation failed: %@", err); }
+
+    // Larger uniform buffer to carry MVP + time/exposure/storm (aligned)
+    _uniformBuffer = [_device newBufferWithLength:sizeof(float)*32 options:MTLResourceStorageModeShared];
+    _skyUniformBuffer = [_device newBufferWithLength:sizeof(float)*32 options:MTLResourceStorageModeShared];
+    _groundUniformBuffer = [_device newBufferWithLength:sizeof(float)*32 options:MTLResourceStorageModeShared];
+
+    // Depth state for sky (no depth write, compare always)
+    MTLDepthStencilDescriptor *skyDepthDesc = [[MTLDepthStencilDescriptor alloc] init];
+    skyDepthDesc.depthCompareFunction = MTLCompareFunctionAlways;
+    skyDepthDesc.depthWriteEnabled = NO;
+    _skyDepthState = [_device newDepthStencilStateWithDescriptor:skyDepthDesc];
+
+    // Build a hemisphere mesh around the camera (radius ~ 30)
+    const int stacks = 16, slices = 32;
+    const float radius = 30.0f;
+    const float phiStart = -0.15f; // extend slightly below horizon to avoid band
+    NSMutableData* domeVerts = [NSMutableData dataWithLength:sizeof(VertexPU)*(stacks+1)*(slices+1)];
+    NSMutableData* domeIdx = [NSMutableData data];
+    VertexPU* vptr = (VertexPU*)domeVerts.mutableBytes;
+    int vidx = 0;
+    for(int i=0;i<=stacks;i++){
+        float phi = phiStart + (float)i/(float)stacks * ((float)M_PI_2 - phiStart); // slightly under horizon .. pi/2
+        float y = sinf(phi);
+        float r = cosf(phi);
+        for(int j=0;j<=slices;j++){
+            float theta = (float)j/(float)slices * (float)(2.0*M_PI);
+            float x = r * cosf(theta);
+            float z = r * sinf(theta);
+            vptr[vidx].pos = (Vec3){ x*radius, y*radius, z*radius };
+            vptr[vidx].uv  = (Vec2){ (float)j/(float)slices, (float)i/(float)stacks };
+            vidx++;
+        }
+    }
+    for(int i=0;i<stacks;i++){
+        for(int j=0;j<slices;j++){
+            uint32_t a = i*(slices+1)+j;
+            uint32_t b = a + slices + 1;
+            uint32_t c = a + 1;
+            uint32_t d = b + 1;
+            uint32_t tri[6] = { a,b,c, c,b,d };
+            [domeIdx appendBytes:tri length:sizeof(tri)];
+        }
+    }
+    _skyVertexBuffer = [_device newBufferWithBytes:domeVerts.bytes length:domeVerts.length options:MTLResourceStorageModeShared];
+    _skyIndexBuffer = [_device newBufferWithBytes:domeIdx.bytes length:domeIdx.length options:MTLResourceStorageModeShared];
+    _skyIndexCount = domeIdx.length/sizeof(uint32_t);
+
+    // Large ground plane centered at origin (y≈-1)
+    typedef struct { float x,y,z,u,v; } GroundV;
+    float gy = -1.05f; float half = 200.0f;
+    GroundV gquad[4] = {
+        { -half, gy, -half, -half, -half },
+        {  half, gy, -half,  half, -half },
+        { -half, gy,  half, -half,  half },
+        {  half, gy,  half,  half,  half }
+    };
+    _groundVertexBuffer = [_device newBufferWithBytes:gquad length:sizeof(gquad) options:MTLResourceStorageModeShared];
+    _groundY = gy; _groundClearance = 0.2f;
+
+    // Build a curved ground dome to close horizon gap
+    const int gStacks = 10, gSlices = 32; const float gRadius = 30.0f;
+    const float gPhiStart = -0.6f; const float gPhiEnd = 0.05f; // overlap slightly into near-horizon
+    NSMutableData* gDomeVerts = [NSMutableData dataWithLength:sizeof(VertexPU)*(gStacks+1)*(gSlices+1)];
+    NSMutableData* gDomeIdx = [NSMutableData data];
+    VertexPU* gv = (VertexPU*)gDomeVerts.mutableBytes; int gvidx=0;
+    for(int i=0;i<=gStacks;i++){
+        float phi = gPhiStart + (float)i/(float)gStacks * (gPhiEnd - gPhiStart);
+        float y = sinf(phi);
+        float r = cosf(phi);
+        for(int j=0;j<=gSlices;j++){
+            float theta = (float)j/(float)gSlices * (float)(2.0*M_PI);
+            float x = r * cosf(theta);
+            float z = r * sinf(theta);
+            gv[gvidx].pos = (Vec3){ x*gRadius, y*gRadius, z*gRadius };
+            gv[gvidx].uv  = (Vec2){ (float)j/(float)gSlices, (float)i/(float)gStacks };
+            gvidx++;
+        }
+    }
+    for(int i=0;i<gStacks;i++){
+        for(int j=0;j<gSlices;j++){
+            uint32_t a = i*(gSlices+1)+j;
+            uint32_t b = a + gSlices + 1;
+            uint32_t c = a + 1;
+            uint32_t d = b + 1;
+            uint32_t tri[6] = { a,b,c, c,b,d };
+            [gDomeIdx appendBytes:tri length:sizeof(tri)];
+        }
+    }
+    _groundDomeVertexBuffer = [_device newBufferWithBytes:gDomeVerts.bytes length:gDomeVerts.length options:MTLResourceStorageModeShared];
+    _groundDomeIndexBuffer = [_device newBufferWithBytes:gDomeIdx.bytes length:gDomeIdx.length options:MTLResourceStorageModeShared];
+    _groundDomeIndexCount = gDomeIdx.length/sizeof(uint32_t);
 
     MTLDepthStencilDescriptor *dsDesc = [[MTLDepthStencilDescriptor alloc] init];
     dsDesc.depthCompareFunction = MTLCompareFunctionLess;
@@ -336,11 +538,15 @@ static BOOL loadGLB(NSString* path,
          _modelCenter[0] = 0.0f; _modelCenter[1] = 0.0f; _modelCenter[2] = 0.0f;
          _modelScale = 5.0f;
      }
+     // Storm state defaults
+     _time = 0.0f; _exposure = 1.0f; _stormIntensity = 0.8f;
      NSLog(@"MMRenderer start");
   }
 
 - (void)renderFrame {
     if (!_running || !_layer) { return; }
+    // Advance time (approximate; tied to frame rate)
+    _time += 1.0f/60.0f;
     [self updateUniforms];
     id<CAMetalDrawable> drawable = [_layer nextDrawable];
     if (!drawable) { return; }
@@ -368,6 +574,52 @@ static BOOL loadGLB(NSString* path,
 
     id<MTLCommandBuffer> cb = [_queue commandBuffer];
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+    // 1) Draw stormy sky dome (infinite depth): view translation removed in uniforms
+    if (_skyPipeline && _skyVertexBuffer) {
+        [enc setRenderPipelineState:_skyPipeline];
+        [enc setDepthStencilState:_skyDepthState];
+        [enc setCullMode:MTLCullModeNone];
+        [enc setFrontFacingWinding:MTLWindingCounterClockwise];
+        [enc setTriangleFillMode:MTLTriangleFillModeFill];
+        [enc setViewport:(MTLViewport){0,0, ds.width, ds.height, 0.0, 1.0}];
+        [enc setVertexBuffer:_skyVertexBuffer offset:0 atIndex:0];
+        [enc setVertexBuffer:_skyUniformBuffer offset:0 atIndex:1];
+        [enc setFragmentBuffer:_skyUniformBuffer offset:0 atIndex:1];
+        if (_skyIndexBuffer && _skyIndexCount>0) {
+            [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:_skyIndexCount indexType:MTLIndexTypeUInt32 indexBuffer:_skyIndexBuffer indexBufferOffset:0];
+        } else {
+            // fallback: draw vertex array if indices missing
+            NSUInteger vcount = _skyVertexBuffer.length/sizeof(VertexPU);
+            [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:vcount];
+        }
+    }
+    // 1.5) Draw ground checker plane
+    if (_groundPipeline && _groundVertexBuffer) {
+        [enc setRenderPipelineState:_groundPipeline];
+        [enc setDepthStencilState:_depthState];
+        [enc setCullMode:MTLCullModeNone];
+        [enc setFrontFacingWinding:MTLWindingCounterClockwise];
+        [enc setTriangleFillMode:MTLTriangleFillModeFill];
+        [enc setViewport:(MTLViewport){0,0, ds.width, ds.height, 0.0, 1.0}];
+        [enc setVertexBuffer:_groundVertexBuffer offset:0 atIndex:0];
+        [enc setVertexBuffer:_groundUniformBuffer offset:0 atIndex:1];
+        [enc setFragmentBuffer:_groundUniformBuffer offset:0 atIndex:1];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    }
+    // 1.6) Draw curved ground dome to ensure seamless horizon closure
+    if (_groundPipeline && _groundDomeVertexBuffer && _groundDomeIndexBuffer && _groundDomeIndexCount>0) {
+        [enc setRenderPipelineState:_groundPipeline];
+        [enc setDepthStencilState:_depthState];
+        [enc setCullMode:MTLCullModeNone];
+        [enc setFrontFacingWinding:MTLWindingCounterClockwise];
+        [enc setTriangleFillMode:MTLTriangleFillModeFill];
+        [enc setViewport:(MTLViewport){0,0, ds.width, ds.height, 0.0, 1.0}];
+        [enc setVertexBuffer:_groundDomeVertexBuffer offset:0 atIndex:0];
+        [enc setVertexBuffer:_groundUniformBuffer offset:0 atIndex:1];
+        [enc setFragmentBuffer:_groundUniformBuffer offset:0 atIndex:1];
+        [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:_groundDomeIndexCount indexType:MTLIndexTypeUInt32 indexBuffer:_groundDomeIndexBuffer indexBufferOffset:0];
+    }
+    // 2) Draw model
     [enc setRenderPipelineState:_pipeline];
     [enc setDepthStencilState:_depthState];
     [enc setCullMode:MTLCullModeNone];
@@ -376,6 +628,7 @@ static BOOL loadGLB(NSString* path,
     [enc setViewport:(MTLViewport){0,0, ds.width, ds.height, 0.0, 1.0}];
     [enc setVertexBuffer:_vertexBuffer offset:0 atIndex:0];
     [enc setVertexBuffer:_uniformBuffer offset:0 atIndex:1];
+    [enc setFragmentBuffer:_uniformBuffer offset:0 atIndex:1];
     if (_texture) {
         static id<MTLSamplerState> sstate;
         if (!sstate) {
@@ -454,6 +707,7 @@ static BOOL loadGLB(NSString* path,
     _modelCenter[0] = (minv.x+maxv.x)*0.5f;
     _modelCenter[1] = (minv.y+maxv.y)*0.5f;
     _modelCenter[2] = (minv.z+maxv.z)*0.5f;
+    _modelMinY = minv.y; _modelMaxY = maxv.y; _modelExtentY = maxv.y - minv.y;
     float ex = maxv.x - minv.x; float ey = maxv.y - minv.y; float ez = maxv.z - minv.z;
     float maxExtent = fmaxf(ex, fmaxf(ey, ez));
     _modelScale = (maxExtent > 0.0f) ? (2.0f / maxExtent) : 1.0f;
@@ -493,6 +747,16 @@ static BOOL loadGLB(NSString* path,
     _indexBuffer = idata.length>0 ? [_device newBufferWithBytes:idata.bytes length:idata.length options:MTLResourceStorageModeShared] : nil;
     _indexCount = idata.length/sizeof(uint32_t);
     _texture = tex;
+    // Compute Y bounds for ground placement
+    Vec3 minv = { FLT_MAX, FLT_MAX, FLT_MAX };
+    Vec3 maxv = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+    const VertexPU* verts = (const VertexPU*)vdata.bytes;
+    for (NSUInteger i=0;i<_vertexCount;i++) {
+        Vec3 p = verts[i].pos;
+        if (p.y < minv.y) minv.y = p.y;
+        if (p.y > maxv.y) maxv.y = p.y;
+    }
+    _modelMinY = minv.y; _modelMaxY = maxv.y; _modelExtentY = maxv.y - minv.y;
     // Auto-fit camera: the model matrix translates center to origin,
     // so aim the camera at the world origin (0,0,0).
     _camTarget[0] = 0.0f;
@@ -545,9 +809,21 @@ static BOOL loadGLB(NSString* path,
     float P[16], V[16], S[16], Tc[16], M[16], PV[16], MVP[16];
      mat4_perspective(P, (float)M_PI/3.0f, aspect, 0.1f, 100.0f);
      // Orbit camera position around target
-     float cx = _camTarget[0] + _camDist * cosf(_camPitch) * sinf(_camYaw);
-     float cy = _camTarget[1] + _camDist * sinf(_camPitch);
-     float cz = _camTarget[2] + _camDist * cosf(_camPitch) * cosf(_camYaw);
+    // Clamp pitch to prevent camera from entering the floor
+    float minPitch = -1.5f;
+    if (_camDist > 0.001f) {
+        float minSin = (_groundY + _groundClearance - _camTarget[1]) / _camDist;
+        // ensure in [-1,1]
+        if (minSin > 1.0f) minSin = 1.0f; if (minSin < -1.0f) minSin = -1.0f;
+        float mp = asinf(minSin);
+        if (mp > minPitch) minPitch = mp;
+    }
+    float usePitch = _camPitch;
+    if (usePitch < minPitch) { usePitch = minPitch; _camPitch = usePitch; }
+
+    float cx = _camTarget[0] + _camDist * cosf(usePitch) * sinf(_camYaw);
+    float cy = _camTarget[1] + _camDist * sinf(usePitch);
+    float cz = _camTarget[2] + _camDist * cosf(usePitch) * cosf(_camYaw);
      // Build lookAt view matrix
      mat4_lookAt(V, cx, cy, cz, _camTarget[0], _camTarget[1], _camTarget[2], 0.0f, 1.0f, 0.0f);
      // When no model is loaded, avoid collapsing geometry by using identity
@@ -558,11 +834,51 @@ static BOOL loadGLB(NSString* path,
         float s = (_modelScale > 0.0f) ? _modelScale : 1.0f;
         mat4_scale(S, s, s, s);
         mat4_translate(Tc, -_modelCenter[0], -_modelCenter[1], -_modelCenter[2]);
-        mat4_mul(M, S, Tc);
+        // Place the model so its minimum Y (after centering and scaling) sits on groundY
+        float baseLocal = (_modelMinY - _modelCenter[1]); // exact offset from center to minY
+        float lift = _groundY - 1e-3f - (baseLocal * s);  // sink a hair to avoid hover
+        float Ty[16]; mat4_translate(Ty, 0.0f, lift, 0.0f);
+        float ST[16]; mat4_mul(ST, S, Tc);
+        mat4_mul(M, Ty, ST);
     }
      mat4_mul(PV, P, V);
      mat4_mul(MVP, PV, M);
-    memcpy(_uniformBuffer.contents, MVP, sizeof(MVP));
+    // Pack uniforms: MVP (16 floats) + time + exposure + storm
+    float U[32];
+    memcpy(U, MVP, sizeof(MVP));
+    U[16] = _time;
+    U[17] = _exposure;
+    U[18] = _stormIntensity;
+    // pad remaining to keep alignment
+    for (int i=19;i<32;i++) U[i]=0.0f;
+    memcpy(_uniformBuffer.contents, U, sizeof(U));
+
+    // Sky uniforms: use same projection, but remove translation from view to simulate infinite distance
+    float Vsky[16]; memcpy(Vsky, V, sizeof(V)); Vsky[12]=0.0f; Vsky[13]=0.0f; Vsky[14]=0.0f;
+    float Msky[16]; mat4_scale(Msky, 1.0f, 1.0f, 1.0f); // dome already large
+    float PVsky[16], MVPsky[16];
+    mat4_mul(PVsky, P, Vsky);
+    mat4_mul(MVPsky, PVsky, Msky);
+    float Us[32]; memcpy(Us, MVPsky, sizeof(MVPsky)); Us[16]=_time; Us[17]=_exposure; Us[18]=_stormIntensity; for(int i=19;i<32;i++) Us[i]=0.0f;
+    memcpy(_skyUniformBuffer.contents, Us, sizeof(Us));
+
+    // Ground uniforms: translate ground to follow camera XZ to look infinite
+    float Mg[16]; mat4_translate(Mg, cx, _groundY, cz);
+    float MVPg[16]; mat4_mul(MVPg, PV, Mg);
+    float Ug[32]; memcpy(Ug, MVPg, sizeof(MVPg));
+    Ug[16] = 2.0f; // tile size (units per square) — larger checks for visibility
+    Ug[17] = _exposure;
+    Ug[18] = _stormIntensity;
+    Ug[19] = cx; // offsetX to anchor pattern in world
+    Ug[20] = cz; // offsetZ
+    // Horizon fog: fine grayscale (near-black) nuance, narrow blend band
+    Ug[21] = 1000.0f;  // fogStart — effectively disables fog
+    Ug[22] = 2000.0f;  // fogEnd — keep far to avoid blend
+    Ug[23] = 0.0f;     // horizonColor — black (no tint)
+    Ug[24] = 0.0f;
+    Ug[25] = 0.0f;
+    for (int i=26;i<32;i++) Ug[i]=0.0f;
+    memcpy(_groundUniformBuffer.contents, Ug, sizeof(Ug));
 }
 
 - (void)stop { _running = NO; NSLog(@"MMRenderer stop"); }
