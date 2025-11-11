@@ -1,0 +1,13 @@
+# Build artifacts
+build/
+
+# IDE caches
+.cache/
+
+# macOS
+.DS_Store
+n.pkl
+
+
+# -----------------  ------------------------- #
+ACRender_default_screen.png
